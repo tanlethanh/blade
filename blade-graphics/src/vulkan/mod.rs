@@ -2,7 +2,14 @@ use ash::{
     khr,
     vk::{self},
 };
-use std::{mem, num::NonZeroU32, path::PathBuf, ptr, sync::Mutex};
+use std::{
+    collections::HashMap,
+    mem,
+    num::NonZeroU32,
+    path::PathBuf,
+    ptr,
+    sync::{Arc, Mutex},
+};
 
 mod command;
 mod descriptor;
@@ -21,7 +28,7 @@ pub enum PlatformError {
 
 struct Instance {
     core: ash::Instance,
-    _debug_utils: ash::ext::debug_utils::Instance,
+    _debug_utils: Option<ash::ext::debug_utils::Instance>,
     get_physical_device_properties2: khr::get_physical_device_properties2::Instance,
     get_surface_capabilities2: Option<khr::get_surface_capabilities2::Instance>,
     surface: Option<khr::surface::Instance>,
@@ -47,14 +54,22 @@ struct Workarounds {
     extra_descriptor_pool_create_flags: vk::DescriptorPoolCreateFlags,
 }
 
+/// Key for caching VkRenderPass objects based on attachment configuration
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct RenderPassKey {
+    color_formats: Vec<vk::Format>,
+    depth_format: vk::Format,
+    stencil_format: vk::Format,
+}
+
 #[derive(Clone)]
 struct Device {
     core: ash::Device,
     device_information: crate::DeviceInformation,
     swapchain: Option<khr::swapchain::Device>,
-    debug_utils: ash::ext::debug_utils::Device,
+    debug_utils: Option<ash::ext::debug_utils::Device>,
     timeline_semaphore: khr::timeline_semaphore::Device,
-    dynamic_rendering: khr::dynamic_rendering::Device,
+    dynamic_rendering: Option<khr::dynamic_rendering::Device>,
     ray_tracing: Option<RayTracingDevice>,
     buffer_marker: Option<ash::amd::buffer_marker::Device>,
     shader_info: Option<ash::amd::shader_info::Device>,
@@ -66,6 +81,8 @@ struct Device {
     command_scope: Option<CommandScopeDevice>,
     timing: Option<TimingDevice>,
     workarounds: Workarounds,
+    // Cache for traditional renderpasses (Vulkan 1.1 fallback)
+    renderpass_cache: Arc<Mutex<HashMap<RenderPassKey, vk::RenderPass>>>,
 }
 
 struct MemoryManager {
@@ -281,6 +298,8 @@ struct CommandBuffer {
     descriptor_pool: descriptor::DescriptorPool,
     query_pool: vk::QueryPool,
     timed_pass_names: Vec<String>,
+    // For traditional renderpass mode: framebuffer to destroy after renderpass ends
+    active_framebuffer: Option<vk::Framebuffer>,
 }
 
 struct CrashHandler {
@@ -299,6 +318,8 @@ pub struct CommandEncoder {
     crash_handler: Option<CrashHandler>,
     temp_label: Vec<u8>,
     timings: crate::Timings,
+    // For traditional renderpass mode: store the surface format
+    surface_format: crate::TextureFormat,
 }
 pub struct TransferCommandEncoder<'a> {
     raw: vk::CommandBuffer,
@@ -420,6 +441,7 @@ impl crate::traits::CommandDevice for Context {
                     descriptor_pool,
                     query_pool,
                     timed_pass_names: Vec::new(),
+                    active_framebuffer: None,
                 }
             })
             .collect();
@@ -448,6 +470,9 @@ impl crate::traits::CommandDevice for Context {
             crash_handler,
             temp_label: Vec::new(),
             timings: Default::default(),
+            // Default to RGBA8_UNORM for traditional renderpass mode
+            // This matches what we use on Android surfaces
+            surface_format: crate::TextureFormat::Rgba8Unorm,
         }
     }
 

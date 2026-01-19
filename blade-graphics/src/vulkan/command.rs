@@ -221,8 +221,10 @@ fn map_render_target(rt: &crate::RenderTarget) -> vk::RenderingAttachmentInfo<'s
 
 fn end_pass(device: &super::Device, cmd_buf: vk::CommandBuffer) {
     if device.command_scope.is_some() {
-        unsafe {
-            device.debug_utils.cmd_end_debug_utils_label(cmd_buf);
+        if let Some(ref debug_utils) = device.debug_utils {
+            unsafe {
+                debug_utils.cmd_end_debug_utils_label(cmd_buf);
+            }
         }
     }
 }
@@ -273,17 +275,19 @@ impl super::CommandEncoder {
         self.add_timestamp(label);
 
         if let Some(_) = self.device.command_scope {
-            self.temp_label.clear();
-            self.temp_label.extend_from_slice(label.as_bytes());
-            self.temp_label.push(0);
-            unsafe {
-                self.device.debug_utils.cmd_begin_debug_utils_label(
-                    self.buffers[0].raw,
-                    &vk::DebugUtilsLabelEXT {
-                        p_label_name: self.temp_label.as_ptr() as *const _,
-                        ..Default::default()
-                    },
-                )
+            if let Some(ref debug_utils) = self.device.debug_utils {
+                self.temp_label.clear();
+                self.temp_label.extend_from_slice(label.as_bytes());
+                self.temp_label.push(0);
+                unsafe {
+                    debug_utils.cmd_begin_debug_utils_label(
+                        self.buffers[0].raw,
+                        &vk::DebugUtilsLabelEXT {
+                            p_label_name: self.temp_label.as_ptr() as *const _,
+                            ..Default::default()
+                        },
+                    )
+                }
             }
         }
     }
@@ -376,9 +380,9 @@ impl super::CommandEncoder {
             .layer_count(1)
             .color_attachments(&color_attachments);
 
-        if let Some(rt) = targets.depth_stencil {
+        if let Some(ref rt) = targets.depth_stencil {
             target_size = rt.view.target_size;
-            depth_stencil_attachment = map_render_target(&rt);
+            depth_stencil_attachment = map_render_target(rt);
             if rt.view.aspects.contains(crate::TexelAspects::DEPTH) {
                 rendering_info = rendering_info.depth_attachment(&depth_stencil_attachment);
             }
@@ -412,9 +416,93 @@ impl super::CommandEncoder {
             self.device
                 .core
                 .cmd_set_scissor(cmd_buf.raw, 0, &[render_area]);
-            self.device
-                .dynamic_rendering
-                .cmd_begin_rendering(cmd_buf.raw, &rendering_info);
+
+            // Use dynamic rendering if available, otherwise use traditional renderpass
+            if let Some(ref dynamic_rendering) = self.device.dynamic_rendering {
+                dynamic_rendering.cmd_begin_rendering(cmd_buf.raw, &rendering_info);
+            } else {
+                // Traditional renderpass mode for Vulkan 1.1
+                // We need to:
+                // 1. Get the renderpass (matches the one used in pipeline creation)
+                // 2. Create a framebuffer with the render target image views
+                // 3. Begin the renderpass
+
+                // Collect image views and formats for framebuffer
+                let mut image_views = Vec::with_capacity(targets.colors.len() + 1);
+                let mut color_formats = Vec::with_capacity(targets.colors.len());
+
+                // For traditional renderpass mode, we need to infer format from context
+                // Since TextureView doesn't store format, we use the surface format for the main target
+                for rt in targets.colors {
+                    image_views.push(rt.view.raw);
+                    // Use the stored surface format (set when command encoder is created)
+                    color_formats.push(super::map_texture_format(self.surface_format));
+                }
+
+                let (depth_format, stencil_format) = if let Some(ref rt) = targets.depth_stencil {
+                    image_views.push(rt.view.raw);
+                    // Assume D24_UNORM_S8_UINT for depth/stencil (common format)
+                    let format = if rt.view.aspects.contains(crate::TexelAspects::DEPTH)
+                        && rt.view.aspects.contains(crate::TexelAspects::STENCIL)
+                    {
+                        vk::Format::D24_UNORM_S8_UINT
+                    } else if rt.view.aspects.contains(crate::TexelAspects::DEPTH) {
+                        vk::Format::D32_SFLOAT
+                    } else {
+                        vk::Format::S8_UINT
+                    };
+
+                    if rt.view.aspects.contains(crate::TexelAspects::DEPTH)
+                        && rt.view.aspects.contains(crate::TexelAspects::STENCIL)
+                    {
+                        (format, format)
+                    } else if rt.view.aspects.contains(crate::TexelAspects::DEPTH) {
+                        (format, vk::Format::UNDEFINED)
+                    } else {
+                        (vk::Format::UNDEFINED, format)
+                    }
+                } else {
+                    (vk::Format::UNDEFINED, vk::Format::UNDEFINED)
+                };
+
+                // Get the matching renderpass (this will be the same one used in pipeline creation)
+                let renderpass = self.device.get_or_create_renderpass(
+                    &color_formats,
+                    depth_format,
+                    stencil_format,
+                );
+
+                // Create a temporary framebuffer for this render pass
+                let framebuffer_create_info = vk::FramebufferCreateInfo::default()
+                    .render_pass(renderpass)
+                    .attachments(&image_views)
+                    .width(target_size[0] as u32)
+                    .height(target_size[1] as u32)
+                    .layers(1);
+
+                let framebuffer = self
+                    .device
+                    .core
+                    .create_framebuffer(&framebuffer_create_info, None)
+                    .unwrap();
+
+                // Store framebuffer in command buffer for cleanup
+                cmd_buf.active_framebuffer = Some(framebuffer);
+
+                // Begin the renderpass
+                let clear_values = vec![]; // We use LOAD_OP_LOAD, so no clear values needed
+                let begin_info = vk::RenderPassBeginInfo::default()
+                    .render_pass(renderpass)
+                    .framebuffer(framebuffer)
+                    .render_area(render_area)
+                    .clear_values(&clear_values);
+
+                self.device.core.cmd_begin_render_pass(
+                    cmd_buf.raw,
+                    &begin_info,
+                    vk::SubpassContents::INLINE,
+                );
+            }
         };
 
         super::RenderCommandEncoder {
@@ -830,9 +918,19 @@ impl<'a> super::RenderCommandEncoder<'a> {
 impl Drop for super::RenderCommandEncoder<'_> {
     fn drop(&mut self) {
         unsafe {
-            self.device
-                .dynamic_rendering
-                .cmd_end_rendering(self.cmd_buf.raw)
+            // End dynamic rendering if available, otherwise end traditional renderpass
+            if let Some(ref dynamic_rendering) = self.device.dynamic_rendering {
+                dynamic_rendering.cmd_end_rendering(self.cmd_buf.raw);
+            } else {
+                // Traditional renderpass mode for Vulkan 1.1
+                // End the renderpass
+                self.device.core.cmd_end_render_pass(self.cmd_buf.raw);
+
+                // Destroy the temporary framebuffer if it was created
+                if let Some(framebuffer) = self.cmd_buf.active_framebuffer.take() {
+                    self.device.core.destroy_framebuffer(framebuffer, None);
+                }
+            }
         };
         end_pass(self.device, self.cmd_buf.raw);
     }

@@ -18,6 +18,11 @@ impl super::Context {
         desc: super::ShaderDesc,
     ) -> Result<super::Shader, &'static str> {
         let module = naga::front::wgsl::parse_str(desc.source).map_err(|e| {
+            log::error!("Shader compilation error: {:?}", e);
+            log::error!(
+                "Shader source preview (first 500 chars):\n{}",
+                &desc.source[..desc.source.len().min(500)]
+            );
             e.emit_to_stderr_with_path(desc.source, "");
             "compilation failed"
         })?;
@@ -38,6 +43,9 @@ impl super::Context {
         let info = naga::valid::Validator::new(flags, caps)
             .validate(&module)
             .map_err(|e| {
+                // Log the error to Android logcat
+                log::error!("Shader validation error: {:?}", e);
+                log::error!("Shader source:\n{}", desc.source);
                 crate::util::emit_annotated_error(&e, "", desc.source);
                 crate::util::print_err(&e);
                 "validation failed"

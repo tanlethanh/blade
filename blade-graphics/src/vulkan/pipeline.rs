@@ -12,6 +12,101 @@ struct CompiledShader<'a> {
     wg_size: [u32; 3],
 }
 
+impl super::Device {
+    /// Get or create a renderpass for the given attachment formats (traditional renderpass fallback for Vulkan 1.1)
+    pub(super) fn get_or_create_renderpass(
+        &self,
+        color_formats: &[vk::Format],
+        depth_format: vk::Format,
+        stencil_format: vk::Format,
+    ) -> vk::RenderPass {
+        let key = super::RenderPassKey {
+            color_formats: color_formats.to_vec(),
+            depth_format,
+            stencil_format,
+        };
+
+        // Check if we already have this renderpass cached
+        {
+            let cache = self.renderpass_cache.lock().unwrap();
+            if let Some(&renderpass) = cache.get(&key) {
+                return renderpass;
+            }
+        }
+
+        // Create a new renderpass
+        let mut attachments = Vec::with_capacity(color_formats.len() + 2);
+        let mut color_refs = Vec::with_capacity(color_formats.len());
+
+        // Add color attachments
+        for (index, &format) in color_formats.iter().enumerate() {
+            attachments.push(
+                vk::AttachmentDescription::default()
+                    .format(format)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .load_op(vk::AttachmentLoadOp::LOAD)
+                    .store_op(vk::AttachmentStoreOp::STORE)
+                    .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                    .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                    .initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+            );
+            color_refs.push(vk::AttachmentReference {
+                attachment: index as u32,
+                layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            });
+        }
+
+        // Add depth/stencil attachment if needed
+        let depth_ref;
+        let mut subpass = vk::SubpassDescription::default()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(&color_refs);
+
+        if depth_format != vk::Format::UNDEFINED || stencil_format != vk::Format::UNDEFINED {
+            let ds_format = if depth_format != vk::Format::UNDEFINED {
+                depth_format
+            } else {
+                stencil_format
+            };
+
+            attachments.push(
+                vk::AttachmentDescription::default()
+                    .format(ds_format)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .load_op(vk::AttachmentLoadOp::LOAD)
+                    .store_op(vk::AttachmentStoreOp::STORE)
+                    .stencil_load_op(vk::AttachmentLoadOp::LOAD)
+                    .stencil_store_op(vk::AttachmentStoreOp::STORE)
+                    .initial_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                    .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
+            );
+            depth_ref = vk::AttachmentReference {
+                attachment: color_formats.len() as u32,
+                layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            };
+            subpass = subpass.depth_stencil_attachment(&depth_ref);
+        }
+
+        let subpasses = [subpass];
+        let create_info = vk::RenderPassCreateInfo::default()
+            .attachments(&attachments)
+            .subpasses(&subpasses);
+
+        let renderpass = unsafe {
+            self.core
+                .create_render_pass(&create_info, None)
+                .unwrap()
+        };
+
+        // Cache the renderpass
+        let mut cache = self.renderpass_cache.lock().unwrap();
+        cache.insert(key, renderpass);
+
+        renderpass
+    }
+}
+
 impl super::Context {
     fn make_spv_options(&self, data_layouts: &[&crate::ShaderDataLayout]) -> spv::Options {
         // collect all the array bindings into overrides
@@ -596,7 +691,8 @@ impl crate::traits::ShaderDevice for super::Context {
             .depth_attachment_format(d_format)
             .stencil_attachment_format(s_format);
 
-        let create_info = vk::GraphicsPipelineCreateInfo::default()
+        // Base create info without renderpass/rendering_info
+        let mut create_info = vk::GraphicsPipelineCreateInfo::default()
             .layout(layout.raw)
             .stages(&stages)
             .vertex_input_state(&vk_vertex_input)
@@ -606,8 +702,19 @@ impl crate::traits::ShaderDevice for super::Context {
             .multisample_state(&vk_multisample)
             .depth_stencil_state(&vk_depth_stencil)
             .color_blend_state(&vk_color_blend)
-            .dynamic_state(&vk_dynamic_state)
-            .push_next(&mut rendering_info);
+            .dynamic_state(&vk_dynamic_state);
+
+        // CRITICAL: Only use PipelineRenderingCreateInfo when dynamic rendering is available
+        // For Vulkan 1.1, this struct is not valid and will cause crashes
+        if self.device.dynamic_rendering.is_some() {
+            create_info = create_info.push_next(&mut rendering_info);
+        } else {
+            // Traditional renderpass mode for Vulkan 1.1
+            // Get or create a renderpass with matching attachment formats
+            let renderpass = self.device.get_or_create_renderpass(&color_formats, d_format, s_format);
+            create_info = create_info.render_pass(renderpass).subpass(0);
+            log::info!("Using traditional renderpass for pipeline creation (Vulkan 1.1 mode)");
+        }
 
         let mut raw_vec = unsafe {
             self.device

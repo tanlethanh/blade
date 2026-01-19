@@ -284,13 +284,25 @@ impl super::Context {
                         )
                     }
                 }
-                crate::ColorSpace::Srgb => (
-                    crate::TextureFormat::Bgra8Unorm,
-                    vk::SurfaceFormatKHR {
+                crate::ColorSpace::Srgb => {
+                    // Try B8G8R8A8_UNORM first (desktop/Windows),
+                    // fallback to R8G8B8A8_UNORM (Android/mobile)
+                    let preferred_format = vk::SurfaceFormatKHR {
                         format: vk::Format::B8G8R8A8_UNORM,
                         color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
-                    },
-                ),
+                    };
+                    if supported_formats.contains(&preferred_format) {
+                        (crate::TextureFormat::Bgra8Unorm, preferred_format)
+                    } else {
+                        // Android fallback - use R8G8B8A8_UNORM
+                        let fallback_format = vk::SurfaceFormatKHR {
+                            format: vk::Format::R8G8B8A8_UNORM,
+                            color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
+                        };
+                        log::info!("Using R8G8B8A8_UNORM fallback format (Android)");
+                        (crate::TextureFormat::Rgba8Unorm, fallback_format)
+                    }
+                }
             }
         };
         if !supported_formats.is_empty() && !supported_formats.contains(&surface_format) {

@@ -17,11 +17,17 @@ mod layer {
         unsafe { CStr::from_bytes_with_nul_unchecked(b"VK_LAYER_MESA_overlay\0") };
 }
 
+// Core extensions required on all platforms
 const REQUIRED_DEVICE_EXTENSIONS: &[&ffi::CStr] = &[
     vk::EXT_INLINE_UNIFORM_BLOCK_NAME,
     vk::KHR_TIMELINE_SEMAPHORE_NAME,
     vk::KHR_DESCRIPTOR_UPDATE_TEMPLATE_NAME,
-    vk::KHR_DYNAMIC_RENDERING_NAME,
+    // VK_KHR_dynamic_rendering is NOT required - we fallback to traditional renderpass
+];
+
+// Optional extensions - prefer if available
+const OPTIONAL_DEVICE_EXTENSIONS: &[&ffi::CStr] = &[
+    vk::KHR_DYNAMIC_RENDERING_NAME, // Vulkan 1.3+ feature
 ];
 
 #[derive(Debug)]
@@ -44,6 +50,7 @@ struct AdapterCapabilities {
     device_information: crate::DeviceInformation,
     queue_family_index: u32,
     layered: bool,
+    dynamic_rendering: bool, // Vulkan 1.3+ feature, fallback to traditional renderpass if false
     ray_tracing: Option<RayTracingCapabilities>,
     buffer_marker: bool,
     shader_info: bool,
@@ -114,6 +121,48 @@ unsafe fn inspect_adapter(
         .iter()
         .map(|ext_prop| ffi::CStr::from_ptr(ext_prop.extension_name.as_ptr()))
         .collect::<Vec<_>>();
+
+    // ANDROID DEBUG: Log Vulkan version and all available device extensions
+    log::info!("========================================");
+    log::info!(
+        "Vulkan API Version: {}.{}.{}",
+        vk::api_version_major(api_version),
+        vk::api_version_minor(api_version),
+        vk::api_version_patch(api_version)
+    );
+    log::info!(
+        "Available Device Extensions ({} total):",
+        supported_extensions.len()
+    );
+    for ext in &supported_extensions {
+        log::info!("  - {:?}", ext);
+    }
+    log::info!("----------------------------------------");
+    log::info!("Required Device Extensions:");
+    for ext in REQUIRED_DEVICE_EXTENSIONS {
+        let available = supported_extensions.contains(ext);
+        log::info!(
+            "  - {:?} [{}]",
+            ext,
+            if available { "✓" } else { "✗ MISSING" }
+        );
+    }
+    log::info!("Optional Device Extensions:");
+    for ext in OPTIONAL_DEVICE_EXTENSIONS {
+        let available = supported_extensions.contains(ext);
+        log::info!(
+            "  - {:?} [{}]",
+            ext,
+            if available {
+                "✓ AVAILABLE"
+            } else {
+                "○ not available, will use fallback"
+            }
+        );
+    }
+    log::info!("========================================");
+
+    // Check required extensions
     for extension in REQUIRED_DEVICE_EXTENSIONS {
         if !supported_extensions.contains(extension) {
             log::warn!(
@@ -186,12 +235,19 @@ unsafe fn inspect_adapter(
         return None;
     }
 
-    if dynamic_rendering_features.dynamic_rendering == 0 {
-        log::warn!(
-            "\tRejected for dynamic rendering. Features = {:?}",
-            dynamic_rendering_features,
+    // Dynamic rendering is optional - if not available, we'll use traditional renderpass
+    let dynamic_rendering_available = supported_extensions
+        .contains(&vk::KHR_DYNAMIC_RENDERING_NAME)
+        && dynamic_rendering_features.dynamic_rendering != 0;
+
+    if !dynamic_rendering_available {
+        log::info!(
+            "Dynamic rendering not available (feature: {}, extension: {}). Will use traditional renderpass fallback.",
+            dynamic_rendering_features.dynamic_rendering != 0,
+            supported_extensions.contains(&vk::KHR_DYNAMIC_RENDERING_NAME)
         );
-        return None;
+    } else {
+        log::info!("Dynamic rendering is available and will be used");
     }
 
     let external_memory = supported_extensions.contains(&vk::KHR_EXTERNAL_MEMORY_NAME);
@@ -277,6 +333,7 @@ unsafe fn inspect_adapter(
         device_information,
         queue_family_index,
         layered: portability_subset_properties.min_vertex_input_binding_stride_alignment != 0,
+        dynamic_rendering: dynamic_rendering_available,
         ray_tracing,
         buffer_marker,
         shader_info,
@@ -348,13 +405,30 @@ impl super::Context {
             .map(|ext_prop| ffi::CStr::from_ptr(ext_prop.extension_name.as_ptr()))
             .collect::<Vec<_>>();
 
+        // ANDROID DEBUG: Log all available instance extensions
+        log::info!("========================================");
+        log::info!("Available Vulkan Instance Extensions:");
+        for ext in &supported_instance_extensions {
+            log::info!("  - {:?}", ext);
+        }
+        log::info!("========================================");
+
         let core_instance = {
             let mut create_flags = vk::InstanceCreateFlags::empty();
 
-            let mut instance_extensions = vec![
-                vk::EXT_DEBUG_UTILS_NAME,
-                vk::KHR_GET_PHYSICAL_DEVICE_PROPERTIES2_NAME,
-            ];
+            let mut instance_extensions = vec![vk::KHR_GET_PHYSICAL_DEVICE_PROPERTIES2_NAME];
+
+            // ANDROID PATCH: Skip debug utils on Android as it's not available on production devices
+            #[cfg(not(target_os = "android"))]
+            {
+                log::info!("Desktop platform - adding VK_EXT_DEBUG_UTILS");
+                instance_extensions.push(vk::EXT_DEBUG_UTILS_NAME);
+            }
+            #[cfg(target_os = "android")]
+            {
+                log::info!("Android platform - SKIPPING VK_EXT_DEBUG_UTILS (patched blade)");
+            }
+
             if desc.presentation {
                 instance_extensions.push(vk::KHR_SURFACE_NAME);
                 instance_extensions.push(vk::KHR_GET_SURFACE_CAPABILITIES2_NAME);
@@ -407,7 +481,16 @@ impl super::Context {
 
         let instance =
             super::Instance {
-                _debug_utils: ext::debug_utils::Instance::new(&entry, &core_instance),
+                _debug_utils: {
+                    #[cfg(not(target_os = "android"))]
+                    {
+                        Some(ext::debug_utils::Instance::new(&entry, &core_instance))
+                    }
+                    #[cfg(target_os = "android")]
+                    {
+                        None
+                    }
+                },
                 get_physical_device_properties2:
                     khr::get_physical_device_properties2::Instance::new(&entry, &core_instance),
                 get_surface_capabilities2: if desc.presentation {
@@ -485,6 +568,14 @@ impl super::Context {
                     vk::KHR_EXTERNAL_MEMORY_FD_NAME
                 });
             }
+            if capabilities.dynamic_rendering {
+                log::info!("Enabling VK_KHR_dynamic_rendering (Vulkan 1.3+ feature)");
+                device_extensions.push(vk::KHR_DYNAMIC_RENDERING_NAME);
+            } else {
+                log::info!(
+                    "VK_KHR_dynamic_rendering not available - will use traditional renderpass"
+                );
+            }
 
             let str_pointers = device_extensions
                 .iter()
@@ -552,9 +643,25 @@ impl super::Context {
             } else {
                 None
             },
-            debug_utils: ext::debug_utils::Device::new(&instance.core, &device_core),
+            debug_utils: {
+                #[cfg(not(target_os = "android"))]
+                {
+                    Some(ext::debug_utils::Device::new(&instance.core, &device_core))
+                }
+                #[cfg(target_os = "android")]
+                {
+                    None
+                }
+            },
             timeline_semaphore: khr::timeline_semaphore::Device::new(&instance.core, &device_core),
-            dynamic_rendering: khr::dynamic_rendering::Device::new(&instance.core, &device_core),
+            dynamic_rendering: if capabilities.dynamic_rendering {
+                Some(khr::dynamic_rendering::Device::new(
+                    &instance.core,
+                    &device_core,
+                ))
+            } else {
+                None
+            },
             ray_tracing: if let Some(ref caps) = capabilities.ray_tracing {
                 Some(super::RayTracingDevice {
                     acceleration_structure: khr::acceleration_structure::Device::new(
@@ -630,6 +737,10 @@ impl super::Context {
                     vk::DescriptorPoolCreateFlags::empty()
                 },
             },
+            // Initialize empty renderpass cache for traditional renderpass fallback (Vulkan 1.1)
+            renderpass_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         };
 
         let memory_manager = {
@@ -757,11 +868,9 @@ impl super::Context {
         let name_info = vk::DebugUtilsObjectNameInfoEXT::default()
             .object_handle(object)
             .object_name(&name_cstr);
-        let _ = unsafe {
-            self.device
-                .debug_utils
-                .set_debug_utils_object_name(&name_info)
-        };
+        if let Some(ref debug_utils) = self.device.debug_utils {
+            let _ = unsafe { debug_utils.set_debug_utils_object_name(&name_info) };
+        }
     }
 
     pub fn capabilities(&self) -> crate::Capabilities {
