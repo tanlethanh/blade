@@ -3,6 +3,7 @@ use ash::vk;
 //TODO: replace by an abstraction in `gpu-descriptor`
 // https://github.com/zakarumych/gpu-descriptor/issues/42
 const COUNT_BASE: u32 = 16;
+const MAX_POOL_SETS: u32 = 65536;
 
 #[derive(Debug)]
 pub struct DescriptorPool {
@@ -92,8 +93,11 @@ impl super::Device {
                 Err(other) => panic!("Unexpected descriptor allocation error: {:?}", other),
             };
 
-            let next_max_sets = COUNT_BASE.pow(pool.growth_iter as u32 + 1);
+            let next_max_sets = COUNT_BASE.pow(pool.growth_iter as u32 + 1).min(MAX_POOL_SETS);
             pool.growth_iter += 1;
+            if next_max_sets >= MAX_POOL_SETS {
+                log::warn!("Descriptor pool reached maximum size cap of {} sets", MAX_POOL_SETS);
+            }
             let vk_pool = self.create_descriptor_sub_pool(next_max_sets);
             pool.sub_pools.insert(0, vk_pool);
         }
@@ -105,6 +109,10 @@ impl super::Device {
                 self.core.destroy_descriptor_pool(vk_pool, None);
             }
         }
+
+        // Reset growth_iter so the next overflow creates a reasonably-sized pool
+        // instead of continuing the exponential growth from previous frames.
+        pool.growth_iter = 0;
 
         unsafe {
             self.core
